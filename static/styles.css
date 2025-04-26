@@ -1,0 +1,100 @@
+body, html {
+    height: 100%;
+    margin: 0;
+}
+
+.container-fluid {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+}
+
+.preview-panel, .analysis-panel {
+    height: 100%;
+    padding: 15px;
+}
+
+.content-box {
+    border: 1px solid #ccc;
+    padding: 10px;
+    height: 75vh;
+    overflow-y: auto;
+    background-color: #f9f9f9;
+}
+
+.preview-panel {
+    border-right: 2px solid #ddd;
+}
+
+.analysis-panel {
+    background-color: #f0f0f0;
+}
+
+.highlight {
+    background-color: yellow;
+}
+
+.sentence-item {
+    margin-bottom: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 5px;
+}
+
+.sentence-item p {
+    cursor: pointer;
+    margin: 0;
+    flex-grow: 1;
+}
+
+.sentence-item div {
+    display: flex;
+    gap: 5px;
+}
+
+#loading-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(255, 255, 255, 0.8);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+}
+
+.active-tcode {
+    font-weight: bold;
+}
+
+#tcode-info, #sentence-tcode-info {
+    border: 1px solid #ccc;
+    padding: 10px;
+    background-color: #e9ecef;
+}
+
+#tcode-info .btn {
+    margin-left: 10px;
+}
+
+.webview {
+    width: 100%;
+    height: 100%;
+    border: none;
+}
+
+.text-preview {
+    white-space: pre-wrap;
+}
+
+#tcode-list {
+    display: flex;
+    flex-wrap: wrap;
+}
+
+#tcode-list .btn {
+    margin-right: 5px;
+}

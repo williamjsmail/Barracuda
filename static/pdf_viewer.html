@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Viewer</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <style>
+        #pdf-container {
+            width: 100%;
+            height: 600px;
+            overflow: auto;
+        }
+        .page {
+            position: relative;
+        }
+        .textLayer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            display: none; /* Temporarily hide to test canvas rendering */
+        }
+        .textLayer span {
+            position: absolute;
+            white-space: pre;
+            color: transparent;
+            background: none;
+            text-shadow: none;
+        }
+        .highlight {
+            background-color: yellow;
+        }
+        #highlight-warning {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(255, 0, 0, 0.8);
+            color: white;
+            padding: 10px;
+            z-index: 1000;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div id="pdf-container"></div>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+        const urlParams = new URLSearchParams(window.location.search);
+        const fileName = urlParams.get('file');
+        const fileUrl = fileName ? `/serve_pdf/${encodeURIComponent(fileName)}` : null;
+        const sentences = urlParams.get('sentences') ? decodeURIComponent(urlParams.get('sentences')).split('||') : [];
+        console.log('PDF viewer loaded, file URL:', fileUrl, 'sentences:', sentences);
+
+        function normalizeText(text) {
+            if (!text) return '';
+            return text.trim().toLowerCase().replace(/\s+/g, ' ').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\[.\]/g, '.');
+        }
+
+        function fuzzyMatch(str1, str2) {
+            function getSimilarity(s1, s2) {
+                let longer = s1.length > s2.length ? s1 : s2;
+                let shorter = s1.length > s2.length ? s2 : s1;
+                let longerLength = longer.length;
+                if (longerLength === 0) return 1.0;
+                let matches = 0;
+                for (let i = 0; i < shorter.length; i++) {
+                    if (shorter[i] === longer[i]) matches++;
+                }
+                return (2.0 * matches) / (longerLength + shorter.length);
+            }
+            return getSimilarity(str1.toLowerCase(), str2.toLowerCase()) >= 0.9;
+        }
+
+        async function highlightSentences(pdf) {
+            console.log('Highlighting sentences:', sentences);
+            const normalizedSentences = sentences.map(s => normalizeText(s));
+            const matchedSentences = new Set();
+            let sentencePositions = [];
+            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                const page = await pdf.getPage(pageNum);
+                const textContent = await page.getTextContent();
+                let pageText = textContent.items.map(item => item.str).join(' ');
+                pageText = normalizeText(pageText);
+                normalizedSentences.forEach((sentence, index) => {
+                    if (!matchedSentences.has(sentence) && sentence && (pageText.includes(sentence) || fuzzyMatch(sentence, pageText))) {
+                        matchedSentences.add(sentence);
+                        console.log(`Found sentence ${index} on page ${pageNum}:`, sentence);
+                        sentencePositions.push({ index: index, page: pageNum, sentence: sentence });
+                    }
+                });
+            }
+            const container = document.getElementById('pdf-container');
+            for (let pos of sentencePositions) {
+                const page = await pdf.getPage(pos.page);
+                const textLayerDiv = container.querySelector(`.page[data-page-number="${pos.page}"] .textLayer`);
+                if (textLayerDiv) {
+                    const textContent = await page.getTextContent();
+                    textContent.items.forEach(item => {
+                        if (normalizeText(item.str).includes(pos.sentence) || fuzzyMatch(pos.sentence, normalizeText(item.str))) {
+                            const span = document.createElement('span');
+                            span.id = `sentence-${pos.index}`;
+                            span.className = 'highlight';
+                            span.textContent = item.str;
+                            const originalSpan = textLayerDiv.querySelector(`span[style*="${item.transform[4]},${item.transform[5]}"]`);
+                            if (originalSpan) {
+                                originalSpan.replaceWith(span);
+                            }
+                        }
+                    });
+                }
+            }
+            normalizedSentences.forEach((s, i) => {
+                if (!matchedSentences.has(s) && s) {
+                    console.warn(`Sentence ${i} not found:`, s);
+                }
+            });
+            const matchRate = sentences.length > 0 ? matchedSentences.size / sentences.length : 0;
+            if (matchRate < 0.5 && sentences.length > 0) {
+                const warning = document.createElement('div');
+                warning.id = 'highlight-warning';
+                warning.textContent = `Only ${Math.round(matchRate * 100)}% of sentences highlighted. Click to dismiss or try text view.`;
+                warning.onclick = () => warning.remove();
+                document.body.appendChild(warning);
+            }
+            return sentencePositions;
+        }
+
+        function scrollToSentence(index, targetSentence) {
+            const span = document.getElementById(`sentence-${index}`);
+            if (span) {
+                const pageDiv = span.closest('.page');
+                if (pageDiv) {
+                    pageDiv.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    span.style.backgroundColor = '#ffeb3b';
+                    setTimeout(() => {
+                        span.style.backgroundColor = 'yellow';
+                    }, 1000);
+                }
+            } else {
+                console.warn('Sentence ID not found:', `sentence-${index}`);
+            }
+        }
+
+        async function loadPdf(attempt = 1) {
+            if (!fileUrl) {
+                console.error('No file URL provided');
+                document.getElementById('pdf-container').innerHTML = '<p>No PDF file specified.</p>';
+                return;
+            }
+            console.log(`Loading PDF from: ${fileUrl} (attempt ${attempt})`);
+            try {
+                const response = await fetch(fileUrl);
+                if (!response.ok) {
+                    throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
+                }
+                const arrayBuffer = await response.arrayBuffer();
+                const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+                const pdf = await loadingTask.promise;
+                console.log('PDF loaded, pages:', pdf.numPages);
+                const container = document.getElementById('pdf-container');
+                container.innerHTML = ''; // Clear container before rendering
+                for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                    const page = await pdf.getPage(pageNum);
+                    const viewport = page.getViewport({ scale: 1.5 });
+                    const pageDiv = document.createElement('div');
+                    pageDiv.className = 'page';
+                    pageDiv.dataset.pageNumber = pageNum;
+                    pageDiv.style.width = `${viewport.width}px`;
+                    pageDiv.style.height = `${viewport.height}px`;
+                    pageDiv.style.margin = '10px auto';
+                    pageDiv.style.position = 'relative';
+                    const canvas = document.createElement('canvas');
+                    const context = canvas.getContext('2d');
+                    canvas.height = viewport.height;
+                    canvas.width = viewport.width;
+                    canvas.style.border = '1px solid black'; // Debug canvas visibility
+                    pageDiv.appendChild(canvas);
+                    const textLayerDiv = document.createElement('div');
+                    textLayerDiv.className = 'textLayer';
+                    textLayerDiv.style.width = `${viewport.width}px`;
+                    textLayerDiv.style.height = `${viewport.height}px`;
+                    pageDiv.appendChild(textLayerDiv);
+                    console.log(`Rendering page ${pageNum}`);
+                    await page.render({
+                        canvasContext: context,
+                        viewport: viewport
+                    }).promise;
+                    const textContent = await page.getTextContent();
+                    console.log(`Page ${pageNum} text items:`, textContent.items.map(item => item.str));
+                    await pdfjsLib.renderTextLayer({
+                        textContent: textContent,
+                        container: textLayerDiv,
+                        viewport: viewport,
+                        textDivs: []
+                    }).promise;
+                    console.log(`Page ${pageNum} text layer rendered`);
+                    container.appendChild(pageDiv);
+                }
+                await highlightSentences(pdf);
+            } catch (error) {
+                console.error(`Error loading PDF (attempt ${attempt}):`, error.message, error.stack);
+                if (attempt < 5) {
+                    console.log(`Retrying PDF load in 2s (attempt ${attempt + 1})`);
+                    setTimeout(() => loadPdf(attempt + 1), 2000);
+                } else {
+                    const errorMsg = `Error loading PDF: ${error.message}. Try text view or refresh the page.`;
+                    console.error(errorMsg);
+                    document.getElementById('pdf-container').innerHTML = `<p style="color: red;">${errorMsg}</p>`;
+                }
+            }
+        }
+
+        loadPdf();
+
+        window.addEventListener('message', (event) => {
+            if (event.data.type === 'scrollToSentence') {
+                console.log('Received scroll request for sentence index:', event.data.index);
+                scrollToSentence(event.data.index, event.data.sentence);
+            }
+        });
+    </script>
+</body>
+</html>

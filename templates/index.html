@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Barracuda</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <style>
+        #tabs-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 1rem;
+        }
+        #tabs {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+        }
+        #tabs .nav-link {
+            padding: 0.5rem 1rem;
+            font-size: 0.9rem;
+            max-width: 200px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            overflow: hidden;
+        }
+        #tabs .nav-link .tab-label {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        #tabs .nav-link .close-tab {
+            flex: 0 0 auto;
+            margin-left: 8px;
+            color: #dc3545;
+            cursor: pointer;
+            font-weight: bold;
+            padding: 0 2px;
+        }
+        #tabs .nav-link.active .close-tab {
+            color: #f8d7da;
+        }
+        #tabs .nav-link .close-tab:hover {
+            color: #a52834;
+        }
+        #tabs .nav-link.active .close-tab:hover {
+            color: #f1aeb5;
+        }
+        #clear-tabs {
+            padding: 0.5rem 1rem;
+            font-size: 0.9rem;
+        }
+        #text-entry-collapse {
+            margin-top: 1rem;
+        }
+        #text-input {
+            width: 100%;
+            min-height: 150px;
+            resize: vertical;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid vh-100">
+        <h1 class="text-center my-3">Barracuda</h1>
+        <div class="row mb-3">
+            <div class="col">
+                <form id="upload-form" enctype="multipart/form-data">
+                    <div class="input-group">
+                        <input type="file" class="form-control" id="file-input" accept=".pdf">
+                        <input type="text" class="form-control" id="url-input" placeholder="Enter URL">
+                        <button class="btn btn-primary" type="submit" id="load-btn">Load</button>
+                    </div>
+                </form>
+                <div class="mt-2">
+                    <button class="btn btn-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#text-entry-collapse" aria-expanded="false" aria-controls="text-entry-collapse">
+                        Enter Raw Text
+                    </button>
+                </div>
+                <div class="collapse" id="text-entry-collapse">
+                    <div class="card card-body mt-2">
+                        <textarea id="text-input" class="form-control" placeholder="Enter raw text for analysis..."></textarea>
+                        <button id="submit-text" class="btn btn-primary mt-2">Submit Text</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div id="tabs-container">
+            <ul id="tabs" class="nav nav-tabs"></ul>
+            <button id="clear-tabs" class="btn btn-danger" style="display: none;">Clear All Tabs</button>
+        </div>
+        <div class="row flex-grow-1">
+            <div class="col-md-6 preview-panel">
+                <h3>Preview</h3>
+                <div id="preview-content" class="content-box"></div>
+                <div class="text-center mt-2">
+                    <button id="toggle-view" class="btn btn-secondary" style="display: none;">Toggle Text View</button>
+                </div>
+            </div>
+            <div class="col-md-6 analysis-panel">
+                <h3>Analysis</h3>
+                <div id="analysis-content" class="content-box">
+                    <div id="tcode-list"></div>
+                    <div id="tcode-info" class="mt-3"></div>
+                    <div id="sentence-list"></div>
+                    <div id="sentence-tcode-info" class="mt-3"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div id="loading-overlay" class="d-none">
+        <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading...</span>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let resultsByInput = {};
+        let currentTab = null;
+        let currentTcode = null;
+        let textCounter = 0;
+        let isSubmitting = false; // Debounce flag
+        const loadingOverlay = document.getElementById('loading-overlay');
+        const toggleButton = document.getElementById('toggle-view');
+        const MAX_TABS = 5;
+
+        function normalizeSentence(sentence) {
+            return sentence.replace(/\s+/g, ' ').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/['"\\]/g, '').replace(/[\x00-\x1F\x7F]/g, '').trim();
+        }
+
+        function sanitizeSentence(sentence) {
+            const div = document.createElement('div');
+            div.textContent = sentence;
+            return div.innerHTML;
+        }
+
+        function fuzzyMatch(str1, str2) {
+            function getSimilarity(s1, s2) {
+                let longer = s1.length > s2.length ? s1 : s2;
+                let shorter = s1.length > s2.length ? s2 : s1;
+                let longerLength = longer.length;
+                if (longerLength === 0) return 1.0;
+                let matches = 0;
+                for (let i = 0; i < shorter.length; i++) {
+                    if (shorter[i] === longer[i]) matches++;
+                }
+                return (2.0 * matches) / (longerLength + shorter.length);
+            }
+            return getSimilarity(str1.toLowerCase(), str2.toLowerCase()) >= 0.85;
+        }
+
+        function addTab(inputKey) {
+            const li = document.createElement('li');
+            li.className = 'nav-item';
+            const a = document.createElement('a');
+            a.className = 'nav-link';
+            a.href = '#';
+            const [type, value] = inputKey.split(':');
+            const shortValue = type === 'url' 
+                ? value.split('/').slice(0, 3).join('/') + '...' 
+                : type === 'text' 
+                ? 'Raw Text' + (textCounter > 0 ? ` (${textCounter})` : '')
+                : value.length > 20 ? value.substring(0, 17) + '...' : value;
+            const labelSpan = document.createElement('span');
+            labelSpan.className = 'tab-label';
+            labelSpan.textContent = `${type}:${shortValue}`;
+            a.appendChild(labelSpan);
+            a.title = inputKey;
+            a.onclick = (e) => {
+                e.preventDefault();
+                switchToTab(inputKey);
+            };
+            const closeBtn = document.createElement('span');
+            closeBtn.className = 'close-tab';
+            closeBtn.textContent = '✖';
+            closeBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                console.log('Closing tab:', inputKey);
+                delete resultsByInput[inputKey];
+                li.remove();
+                updateClearTabsButton();
+                if (currentTab === inputKey) {
+                    const remainingTabs = Object.keys(resultsByInput);
+                    switchToTab(remainingTabs.length > 0 ? remainingTabs[0] : null);
+                }
+            });
+            a.appendChild(closeBtn);
+            li.appendChild(a);
+            document.getElementById('tabs').appendChild(li);
+            a.classList.toggle('active', currentTab === inputKey);
+        }
+
+        function switchToTab(inputKey) {
+            currentTab = inputKey;
+            currentTcode = null;
+            const tabs = document.querySelectorAll('#tabs .nav-link');
+            tabs.forEach(t => t.classList.remove('active'));
+            if (inputKey) {
+                const activeTab = Array.from(tabs).find(t => t.title === inputKey);
+                if (activeTab) activeTab.classList.add('active');
+                const data = resultsByInput[inputKey];
+                renderPreview(data);
+                displayTcodes(data.tcode_counts, data.tcode_to_sentences, data.tcode_names);
+                document.getElementById('tcode-info').innerHTML = '';
+                document.getElementById('sentence-list').innerHTML = '';
+                document.getElementById('sentence-tcode-info').innerHTML = '';
+            } else {
+                document.getElementById('preview-content').innerHTML = '';
+                document.getElementById('tcode-list').innerHTML = '';
+                document.getElementById('tcode-info').innerHTML = '';
+                document.getElementById('sentence-list').innerHTML = '';
+                document.getElementById('sentence-tcode-info').innerHTML = '';
+                toggleButton.style.display = 'none';
+            }
+        }
+
+        function updateClearTabsButton() {
+            const clearTabsButton = document.getElementById('clear-tabs');
+            clearTabsButton.style.display = Object.keys(resultsByInput).length > 0 ? 'block' : 'none';
+        }
+
+        // Handle URL/PDF submission
+        document.getElementById('upload-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            if (isSubmitting) {
+                console.log('Submission in progress, ignoring duplicate request');
+                return;
+            }
+            isSubmitting = true;
+            const loadBtn = document.getElementById('load-btn');
+            loadBtn.disabled = true;
+
+            loadingOverlay.classList.remove('d-none');
+            const fileInput = document.getElementById('file-input');
+            const urlInput = document.getElementById('url-input');
+            const previewContent = document.getElementById('preview-content');
+            const formData = new FormData();
+
+            if (fileInput.files.length > 0) {
+                formData.append('file', fileInput.files[0]);
+            } else if (urlInput.value.trim()) {
+                formData.append('url', urlInput.value.trim());
+            } else {
+                previewContent.innerHTML = '<p>Please provide a PDF file or URL.</p>';
+                loadingOverlay.classList.add('d-none');
+                isSubmitting = false;
+                loadBtn.disabled = false;
+                return;
+            }
+
+            try {
+                console.log('Sending upload request for URL/PDF');
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 30000);
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData,
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+                console.log('Upload response status:', response.status, 'OK:', response.ok);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+                const data = await response.json();
+                console.log('Upload response data:', data);
+                if (data.full_text) {
+                    const inputKey = data.source_type === 'url' ? `url:${data.url}` : `pdf:${data.pdf_filename}`;
+                    const currentTabs = Object.keys(resultsByInput);
+                    if (currentTabs.length >= MAX_TABS && !currentTabs.includes(inputKey)) {
+                        alert(`Maximum tabs (${MAX_TABS}) reached. Close a tab to add a new analysis.`);
+                        loadingOverlay.classList.add('d-none');
+                        isSubmitting = false;
+                        loadBtn.disabled = false;
+                        return;
+                    }
+                    data.sentenceToTcodes = {};
+                    data.isPdfView = data.source_type === 'file' && typeof data.pdf_filename === 'string' && data.pdf_filename.toLowerCase().endsWith('.pdf');
+                    Object.entries(data.tcode_to_sentences).forEach(([tcode, sentences]) => {
+                        sentences.forEach((item, idx) => {
+                            const sentence = normalizeSentence(item.sentence);
+                            if (!data.sentenceToTcodes[sentence]) {
+                                data.sentenceToTcodes[sentence] = [];
+                            }
+                            data.sentenceToTcodes[sentence].push({ tcode: tcode, score: item.score, index: idx });
+                            console.log(`Mapped sentence: "${sentence}" to T-Code: ${tcode} (index: ${idx})`);
+                        });
+                    });
+                    console.log('sentenceToTcodes:', data.sentenceToTcodes);
+                    resultsByInput[inputKey] = data;
+                    if (!currentTabs.includes(inputKey)) addTab(inputKey);
+                    switchToTab(inputKey);
+                    updateClearTabsButton();
+                    // Clear inputs
+                    fileInput.value = '';
+                    urlInput.value = '';
+                } else {
+                    console.warn('No full_text in response:', data);
+                    const errorMsg = data.error || data.content || 'Failed to process file or URL. Check server logs for details.';
+                    previewContent.innerHTML = `<p class="text-danger">${errorMsg}</p>`;
+                    toggleButton.style.display = 'none';
+                }
+            } catch (error) {
+                console.error('Upload fetch error:', error.name, error.message, error.stack);
+                previewContent.innerHTML = `<p class="text-danger">Error loading content: ${error.message || 'Network or server error'}. Please ensure the server is running and try again.</p>`;
+                toggleButton.style.display = 'none';
+            } finally {
+                loadingOverlay.classList.add('d-none');
+                isSubmitting = false;
+                loadBtn.disabled = false;
+            }
+        });
+
+        // Handle raw text submission
+        document.getElementById('submit-text').addEventListener('click', async () => {
+            if (isSubmitting) {
+                console.log('Submission in progress, ignoring duplicate request');
+                return;
+            }
+            isSubmitting = true;
+            const submitBtn = document.getElementById('submit-text');
+            submitBtn.disabled = true;
+
+            const textInput = document.getElementById('text-input');
+            const text = textInput.value.trim();
+            const previewContent = document.getElementById('preview-content');
+
+            if (!text) {
+                previewContent.innerHTML = '<p>Please enter some text to analyze.</p>';
+                isSubmitting = false;
+                submitBtn.disabled = false;
+                return;
+            }
+
+            loadingOverlay.classList.remove('d-none');
+            try {
+                console.log('Sending raw text for analysis:', text);
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ text: text })
+                });
+                console.log('Text analysis response status:', response.status, 'OK:', response.ok);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+                const data = await response.json();
+                console.log('Text analysis response data:', data);
+                if (data.full_text) {
+                    textCounter++;
+                    const inputKey = `text:Raw Text ${textCounter}`;
+                    const currentTabs = Object.keys(resultsByInput);
+                    if (currentTabs.length >= MAX_TABS && !currentTabs.includes(inputKey)) {
+                        alert(`Maximum tabs (${MAX_TABS}) reached. Close a tab to add a new analysis.`);
+                        loadingOverlay.classList.add('d-none');
+                        isSubmitting = false;
+                        submitBtn.disabled = false;
+                        return;
+                    }
+                    data.source_type = 'text';
+                    data.sentenceToTcodes = {};
+                    data.isPdfView = false;
+                    Object.entries(data.tcode_to_sentences).forEach(([tcode, sentences]) => {
+                        sentences.forEach((item, idx) => {
+                            const sentence = normalizeSentence(item.sentence);
+                            if (!data.sentenceToTcodes[sentence]) {
+                                data.sentenceToTcodes[sentence] = [];
+                            }
+                            data.sentenceToTcodes[sentence].push({ tcode: tcode, score: item.score, index: idx });
+                            console.log(`Mapped sentence: "${sentence}" to T-Code: ${tcode} (index: ${idx})`);
+                        });
+                    });
+                    console.log('sentenceToTcodes:', data.sentenceToTcodes);
+                    resultsByInput[inputKey] = data;
+                    if (!currentTabs.includes(inputKey)) addTab(inputKey);
+                    switchToTab(inputKey);
+                    updateClearTabsButton();
+                    // Clear textarea and collapse
+                    textInput.value = '';
+                    const collapseElement = document.getElementById('text-entry-collapse');
+                    const bsCollapse = new bootstrap.Collapse(collapseElement, { toggle: false });
+                    bsCollapse.hide();
+                } else {
+                    console.warn('No full_text in response:', data);
+                    const errorMsg = data.error || data.content || 'Failed to process text. Check server logs for details.';
+                    previewContent.innerHTML = `<p class="text-danger">${errorMsg}</p>`;
+                }
+            } catch (error) {
+                console.error('Text analysis fetch error:', error.name, error.message, error.stack);
+                previewContent.innerHTML = `<p class="text-danger">Error analyzing text: ${error.message || 'Network or server error'}. Please ensure the server is running and try again.</p>`;
+            } finally {
+                loadingOverlay.classList.add('d-none');
+                isSubmitting = false;
+                submitBtn.disabled = false;
+            }
+        });
+
+        toggleButton.addEventListener('click', () => {
+            if (!currentTab) return;
+            const data = resultsByInput[currentTab];
+            data.isPdfView = !data.isPdfView;
+            renderPreview(data);
+            toggleButton.textContent = data.isPdfView ? 'Show Text View' : 'Show PDF View';
+        });
+
+        function renderPreview(data) {
+            const previewContent = document.getElementById('preview-content');
+            if (data.source_type === 'file' && typeof data.pdf_filename === 'string' && data.pdf_filename.toLowerCase().endsWith('.pdf')) {
+                toggleButton.style.display = 'block';
+                toggleButton.textContent = data.isPdfView ? 'Show Text View' : 'Show PDF View';
+                const sentences = (currentTcode && data.tcode_to_sentences[currentTcode]) 
+                    ? data.tcode_to_sentences[currentTcode].map(s => normalizeSentence(s.sentence)) 
+                    : [];
+                const encodedSentences = encodeURIComponent(sentences.join('||'));
+                const pdfUrl = `/static/pdf_viewer.html?file=${encodeURIComponent(data.pdf_filename)}&sentences=${encodedSentences}`;
+                console.log('PDF iframe URL:', pdfUrl);
+                previewContent.innerHTML = data.isPdfView 
+                    ? `<iframe src="${pdfUrl}" class="webview" title="PDF Preview"></iframe>`
+                    : `<div class="text-preview">${data.full_text}</div>`;
+                if (!data.isPdfView && currentTcode && data.tcode_to_sentences[currentTcode]) {
+                    const sentences = data.tcode_to_sentences[currentTcode].map(s => normalizeSentence(s.sentence));
+                    highlightSentences(sentences);
+                }
+            } else {
+                toggleButton.style.display = 'none';
+                previewContent.innerHTML = `<div class="text-preview">${data.full_text}</div>`;
+                if (currentTcode && data.tcode_to_sentences[currentTcode]) {
+                    const sentences = data.tcode_to_sentences[currentTcode].map(s => normalizeSentence(s.sentence));
+                    highlightSentences(sentences);
+                }
+            }
+        }
+
+        function displayTcodes(tcodeCounts, tcodeToSentences, tcodeNames) {
+            const tcodeList = document.getElementById('tcode-list');
+            tcodeList.innerHTML = '';
+            Object.entries(tcodeCounts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).forEach(([tcode, count]) => {
+                const button = document.createElement('button');
+                button.textContent = `${tcode} (${count})`;
+                button.className = 'btn btn-outline-primary m-1';
+                button.dataset.tcode = tcode;
+                button.onclick = () => selectTcode(tcode, tcodeToSentences[tcode], tcodeNames[tcode]);
+                tcodeList.appendChild(button);
+            });
+            if (currentTcode && tcodeCounts[currentTcode]) {
+                highlightTcodeButton(currentTcode);
+            }
+        }
+
+        function selectTcode(tcode, sentences, tcodeName, forceUpdate = false) {
+            if (!currentTab) return;
+            const data = resultsByInput[currentTab];
+            if (currentTcode !== tcode || forceUpdate) {
+                currentTcode = tcode;
+                const previewContent = document.getElementById('preview-content');
+                const sentenceStrings = sentences.map(s => normalizeSentence(s.sentence));
+                if (data.source_type === 'file' && data.isPdfView && typeof data.pdf_filename === 'string' && data.pdf_filename.toLowerCase().endsWith('.pdf')) {
+                    const normalizedSentences = sentenceStrings.map(s => s.replace(/\s+/g, ' ').trim());
+                    const encodedSentences = encodeURIComponent(normalizedSentences.join('||'));
+                    const pdfUrl = `/static/pdf_viewer.html?file=${encodeURIComponent(data.pdf_filename)}&sentences=${encodedSentences}`;
+                    console.log('PDF iframe URL:', pdfUrl);
+                    previewContent.innerHTML = `<iframe src="${pdfUrl}" class="webview" title="PDF Preview"></iframe>`;
+                } else {
+                    previewContent.innerHTML = `<div class="text-preview">${data.full_text}</div>`;
+                    highlightSentences(sentenceStrings);
+                }
+                displaySentences(tcode, sentences);
+                highlightTcodeButton(tcode);
+                displayTcodeInfo(tcode, tcodeName);
+                document.getElementById('sentence-tcode-info').innerHTML = '';
+            }
+        }
+
+        function highlightSentences(sentences) {
+            const preview = document.querySelector('#preview-content .text-preview');
+            if (preview) {
+                let text = preview.textContent;
+                sentences.forEach((sentence, index) => {
+                    const escapedSentence = sentence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\[.\]/g, '.');
+                    const regex = new RegExp(escapedSentence, 'g');
+                    text = text.replace(regex, `<span id="text-sentence-${index}" class="highlight">${sentence}</span>`);
+                });
+                preview.innerHTML = text;
+            }
+        }
+
+        function highlightTcodeButton(tcode) {
+            const buttons = document.querySelectorAll('#tcode-list button[data-tcode]');
+            buttons.forEach(button => {
+                if (button.dataset.tcode === tcode) {
+                    button.classList.remove('btn-outline-primary');
+                    button.classList.add('btn-primary', 'active-tcode');
+                } else {
+                    button.classList.remove('btn-primary', 'active-tcode');
+                    button.classList.add('btn-outline-primary');
+                }
+            });
+        }
+
+        function displaySentences(tcode, sentences) {
+            const sentenceList = document.getElementById('sentence-list');
+            sentenceList.innerHTML = '';
+            sentences.forEach((item, index) => {
+                const sentence = normalizeSentence(item.sentence);
+                const encodedSentence = encodeURIComponent(sentence);
+                const sanitizedSentence = sanitizeSentence(sentence);
+                const div = document.createElement('div');
+                div.className = 'sentence-item';
+                div.dataset.sentence = sentence;
+                div.dataset.encodedSentence = encodedSentence;
+                div.dataset.tcode = tcode;
+                div.dataset.index = index;
+                div.innerHTML = `
+                    <p>${sanitizedSentence}</p>
+                    <div>
+                        <button class="btn btn-danger btn-sm me-1 drop-sentence">Drop</button>
+                        <button class="btn btn-warning btn-sm drop-all">Drop from All</button>
+                    </div>
+                `;
+                sentenceList.appendChild(div);
+            });
+        }
+
+        // Attach the click event listener for sentence items once, outside of displaySentences
+        document.getElementById('sentence-list').addEventListener('click', (e) => {
+            const sentenceItem = e.target.closest('.sentence-item');
+            if (!sentenceItem) return;
+
+            const encodedSentence = sentenceItem.dataset.encodedSentence;
+            const index = parseInt(sentenceItem.dataset.index);
+            const tcode = sentenceItem.dataset.tcode;
+
+            if (e.target.classList.contains('drop-sentence')) {
+                console.log(`Attempting to drop sentence: "${decodeURIComponent(encodedSentence)}" from T-Code: ${tcode}, index: ${index}`);
+                dropSentence(tcode, index, e.target);
+            } else if (e.target.classList.contains('drop-all')) {
+                console.log(`Attempting to drop sentence: "${decodeURIComponent(encodedSentence)}" from all T-Codes`);
+                dropSentenceFromAllTcodes(encodedSentence, e.target);
+            } else if (e.target.tagName === 'P') {
+                navigateToSentence(encodedSentence, index, sentenceItem);
+            }
+        });
+
+        function displayTcodeInfo(tcode, tcodeName) {
+            const tcodeInfo = document.getElementById('tcode-info');
+            tcodeInfo.innerHTML = `
+                <div class="d-flex align-items-center">
+                    <h5 class="me-2">Selected T-Code: ${tcode}</h5>
+                    <button class="btn btn-danger btn-sm" onclick="dropTcode('${tcode}')">Drop</button>
+                </div>
+                <p><strong>Name:</strong> ${tcodeName}</p>
+            `;
+        }
+
+        function navigateToSentence(encodedSentence, sentenceIndex, sentenceItem) {
+            if (!currentTab) return;
+            const data = resultsByInput[currentTab];
+            const sentence = decodeURIComponent(encodedSentence);
+            const normalizedSentence = normalizeSentence(sentence);
+            console.log('Navigating to sentence:', normalizedSentence, 'index:', sentenceIndex);
+            if (sentenceItem) {
+                sentenceItem.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+            if (data.source_type === 'file' && data.isPdfView && typeof data.pdf_filename === 'string' && data.pdf_filename.toLowerCase().endsWith('.pdf')) {
+                const iframe = document.querySelector('#preview-content iframe');
+                if (iframe && iframe.contentWindow) {
+                    iframe.contentWindow.postMessage({ type: 'scrollToSentence', index: sentenceIndex, sentence: normalizedSentence }, '*');
+                    showTcodesForSentence(encodedSentence, sentenceItem);
+                } else {
+                    console.error('Iframe not ready for scrolling');
+                    showTcodesForSentence(encodedSentence, sentenceItem);
+                }
+            } else {
+                const span = document.getElementById(`text-sentence-${sentenceIndex}`);
+                if (span) {
+                    span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    span.style.backgroundColor = '#ffeb3b';
+                    setTimeout(() => {
+                        span.style.backgroundColor = 'yellow';
+                    }, 1000);
+                    showTcodesForSentence(encodedSentence, sentenceItem);
+                } else {
+                    console.warn('Text span not found for index:', sentenceIndex);
+                    showTcodesForSentence(encodedSentence, sentenceItem);
+                }
+            }
+        }
+
+        function showTcodesForSentence(encodedSentence, sentenceItem) {
+            if (!currentTab) return;
+            const data = resultsByInput[currentTab];
+            const sentence = decodeURIComponent(encodedSentence);
+            const normalizedSentence = normalizeSentence(sentence);
+            console.log('Looking up T-Codes for sentence:', normalizedSentence);
+            let tcodes = data.sentenceToTcodes[normalizedSentence] || [];
+            if (!tcodes.length) {
+                console.warn('No exact match for sentence, trying fuzzy match:', normalizedSentence);
+                for (const [key, value] of Object.entries(data.sentenceToTcodes)) {
+                    if (fuzzyMatch(normalizedSentence, key)) {
+                        tcodes = value;
+                        console.log('Fuzzy match found:', key, tcodes);
+                        break;
+                    }
+                }
+            }
+            const sentenceTcodeInfo = document.getElementById('sentence-tcode-info');
+            if (tcodes.length > 0) {
+                sentenceTcodeInfo.innerHTML = `
+                    <h5>Sentence: "${sanitizeSentence(sentence)}"</h5>
+                    <p><strong>Associated T-Codes:</strong></p>
+                    <ul>
+                        ${tcodes.map(t => `<li>${t.tcode}: ${data.tcode_names[t.tcode] || 'Unknown'} (Score: ${t.score.toFixed(2)})</li>`).join('')}
+                    </ul>
+                `;
+                if (sentenceItem) {
+                    sentenceItem.style.backgroundColor = '#e0ffe0';
+                    setTimeout(() => {
+                        sentenceItem.style.backgroundColor = '';
+                    }, 1000);
+                }
+            } else {
+                sentenceTcodeInfo.innerHTML = `
+                    <h5>Sentence: "${sanitizeSentence(sentence)}"</h5>
+                    <p>No associated T-Codes found for this sentence.</p>
+                `;
+                console.error('No T-Codes for sentence:', normalizedSentence);
+                if (sentenceItem) {
+                    sentenceItem.style.backgroundColor = '#ffe0e0';
+                    setTimeout(() => {
+                        sentenceItem.style.backgroundColor = '';
+                    }, 1000);
+                }
+            }
+        }
+
+        function dropSentence(tcode, index, button) {
+            if (!currentTab) return;
+            const data = resultsByInput[currentTab];
+            const sentence = normalizeSentence(data.tcode_to_sentences[tcode][index].sentence);
+            if (confirm(`Are you sure you want to drop this sentence from T-Code ${tcode}?`)) {
+                try {
+                    data.tcode_to_sentences[tcode].splice(index, 1);
+                    if (data.tcode_to_sentences[tcode].length === 0) {
+                        delete data.tcode_to_sentences[tcode];
+                        delete data.tcode_counts[tcode];
+                        delete data.tcode_names[tcode];
+                        if (currentTcode === tcode) {
+                            currentTcode = null;
+                            const previewContent = document.getElementById('preview-content');
+                            if (data.source_type === 'file' && data.isPdfView && typeof data.pdf_filename === 'string' && data.pdf_filename.toLowerCase().endsWith('.pdf')) {
+                                const pdfUrl = `/static/pdf_viewer.html?file=${encodeURIComponent(data.pdf_filename)}`;
+                                previewContent.innerHTML = `<iframe src="${pdfUrl}" class="webview" title="PDF Preview"></iframe>`;
+                            } else {
+                                previewContent.innerHTML = `<div class="text-preview">${data.full_text}</div>`;
+                            }
+                            document.getElementById('sentence-list').innerHTML = '';
+                            document.getElementById('tcode-info').innerHTML = '';
+                            document.getElementById('sentence-tcode-info').innerHTML = '';
+                        }
+                    } else {
+                        data.tcode_counts[tcode] = data.tcode_to_sentences[tcode].length;
+                        if (sentence && data.sentenceToTcodes[sentence]) {
+                            data.sentenceToTcodes[sentence] = data.sentenceToTcodes[sentence].filter(t => t.tcode !== tcode);
+                            if (data.sentenceToTcodes[sentence].length === 0) {
+                                delete data.sentenceToTcodes[sentence];
+                            }
+                        }
+                    }
+                    displayTcodes(data.tcode_counts, data.tcode_to_sentences, data.tcode_names);
+                    if (currentTcode && currentTcode in data.tcode_counts) {
+                        selectTcode(currentTcode, data.tcode_to_sentences[currentTcode], data.tcode_names[currentTcode], true);
+                    }
+                } catch (error) {
+                    console.error('Drop sentence failed:', error.message);
+                    button.style.backgroundColor = '#ff0000';
+                    setTimeout(() => {
+                        button.style.backgroundColor = '';
+                    }, 1000);
+                }
+            }
+        }
+
+        function dropSentenceFromAllTcodes(encodedSentence, button) {
+            if (!currentTab) return;
+            const data = resultsByInput[currentTab];
+            const sentence = decodeURIComponent(encodedSentence);
+            const normalizedSentence = normalizeSentence(sentence);
+            if (confirm(`Are you sure you want to drop the sentence "${sentence}" from all T-Codes?`)) {
+                try {
+                    const tcodes = data.sentenceToTcodes[normalizedSentence] || [];
+                    tcodes.forEach(({ tcode }) => {
+                        data.tcode_to_sentences[tcode] = data.tcode_to_sentences[tcode].filter(
+                            item => normalizeSentence(item.sentence) !== normalizedSentence
+                        );
+                        if (data.tcode_to_sentences[tcode].length === 0) {
+                            delete data.tcode_to_sentences[tcode];
+                            delete data.tcode_counts[tcode];
+                            delete data.tcode_names[tcode];
+                        } else {
+                            data.tcode_counts[tcode] = data.tcode_to_sentences[tcode].length;
+                        }
+                    });
+                    delete data.sentenceToTcodes[normalizedSentence];
+                    if (currentTcode && !data.tcode_counts[currentTcode]) {
+                        currentTcode = null;
+                        const previewContent = document.getElementById('preview-content');
+                        if (data.source_type === 'file' && data.isPdfView && typeof data.pdf_filename === 'string' && data.pdf_filename.toLowerCase().endsWith('.pdf')) {
+                            const pdfUrl = `/static/pdf_viewer.html?file=${encodeURIComponent(data.pdf_filename)}`;
+                            previewContent.innerHTML = `<iframe src="${pdfUrl}" class="webview" title="PDF Preview"></iframe>`;
+                        } else {
+                            previewContent.innerHTML = `<div class="text-preview">${data.full_text}</div>`;
+                        }
+                        document.getElementById('sentence-list').innerHTML = '';
+                        document.getElementById('tcode-info').innerHTML = '';
+                        document.getElementById('sentence-tcode-info').innerHTML = '';
+                    } else if (currentTcode) {
+                        selectTcode(currentTcode, data.tcode_to_sentences[currentTcode], data.tcode_names[currentTcode], true);
+                    }
+                    displayTcodes(data.tcode_counts, data.tcode_to_sentences, data.tcode_names);
+                } catch (error) {
+                    console.error('Drop sentence from all failed:', error.message);
+                    button.style.backgroundColor = '#ff0000';
+                    setTimeout(() => {
+                        button.style.backgroundColor = '';
+                    }, 1000);
+                }
+            }
+        }
+
+        function dropTcode(tcode) {
+            if (!currentTab) return;
+            const data = resultsByInput[currentTab];
+            if (confirm(`Are you sure you want to drop T-Code ${tcode} and all its associated sentences?`)) {
+                const sentences = data.tcode_to_sentences[tcode] || [];
+                delete data.tcode_to_sentences[tcode];
+                delete data.tcode_counts[tcode];
+                delete data.tcode_names[tcode];
+                sentences.forEach(item => {
+                    const sentence = normalizeSentence(item.sentence);
+                    if (data.sentenceToTcodes[sentence]) {
+                        data.sentenceToTcodes[sentence] = data.sentenceToTcodes[sentence].filter(t => t.tcode !== tcode);
+                        if (data.sentenceToTcodes[sentence].length === 0) {
+                            delete data.sentenceToTcodes[sentence];
+                        }
+                    }
+                });
+                if (currentTcode === tcode) {
+                    currentTcode = null;
+                    const previewContent = document.getElementById('preview-content');
+                    if (data.source_type === 'file' && data.isPdfView && typeof data.pdf_filename === 'string' && data.pdf_filename.toLowerCase().endsWith('.pdf')) {
+                        const pdfUrl = `/static/pdf_viewer.html?file=${encodeURIComponent(data.pdf_filename)}`;
+                        previewContent.innerHTML = `<iframe src="${pdfUrl}" class="webview" title="PDF Preview"></iframe>`;
+                    } else {
+                        previewContent.innerHTML = `<div class="text-preview">${data.full_text}</div>`;
+                    }
+                    document.getElementById('sentence-list').innerHTML = '';
+                    document.getElementById('tcode-info').innerHTML = '';
+                    document.getElementById('sentence-tcode-info').innerHTML = '';
+                }
+                displayTcodes(data.tcode_counts, data.tcode_to_sentences, data.tcode_names);
+            }
+        }
+
+        document.getElementById('clear-tabs').addEventListener('click', () => {
+            resultsByInput = {};
+            document.getElementById('tabs').innerHTML = '';
+            switchToTab(null);
+            updateClearTabsButton();
+        });
+    </script>
+</body>
+</html>
