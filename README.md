@@ -34,6 +34,26 @@ Prerequisites
 
 -   **Web Browser**: A modern browser (e.g., Chrome, Firefox) to access the web interface.
 
+Installation
+-------------
+
+```
+git clone https://github.com/williamjsmail/Barracuda
+cd Barracuda
+pip install -r requirements.txt
+python .\app.py
+```
+
+After initial installation steps, additional files will be download for the 'all-mpnet-base-v2' pre-trained sentence transformer model. Once downloads are complete, training will occur. This normally take 5-10 minutes depending on CPU. If you have an NVIDIA GPU, Barracuda will identify this and training will be increased anywhere from 10x-50x. After additional training is completed, a python flask server will be started on 'http://localhost:5000'.
+
+Usage
+-------------
+
+To use Barracuda, provide a Cyber Threat Intelligence report in PDF, a URL, or raw text. It will then create a tab for your analysis. Techniques identified will be shown in the right hand analysis panel. Click on a T-Code to view the sentences associated with it. You can then click on a sentence to show you where the sentence lives within the document, or view additional T-Codes the sentences is associated with. If you find a sentence to be irrelevant to the T-Code or irrelevant in general (i.e. advertisements on a webpage), simply click 'Drop' or 'Drop from All'. This will allow you to disassociate the sentence from either the one T-Code, or every T-Code. To drop and entire T-Code, simply click 'Drop' next to the 'Selected T-Code:' field.
+
+![Barracuda Demo](images/demo.gif)
+
+
 License
 -------
 
