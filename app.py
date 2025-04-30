@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app, resources={r"/serve_pdf/*": {"origins": "*"}})
-UPLOAD_FOLDER = 'Uploads'
+UPLOAD_FOLDER = 'uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 # Global cache for model and precomputed data
