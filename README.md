@@ -40,7 +40,7 @@ Installation
 ```
 git clone https://github.com/williamjsmail/Barracuda
 cd Barracuda
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python .\app.py
 ```
 
