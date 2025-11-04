@@ -1,4 +1,4 @@
-Barracuda v1.0
+Barracuda
 =========
 
 Overview
