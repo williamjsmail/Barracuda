@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask import Flask, render_template, request, jsonify, Response, send_from_directory, send_file
 from flask_cors import CORS
 import json
 import re
@@ -11,8 +11,18 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import requests
 from bs4 import BeautifulSoup
 import os
+import pickle
 import pdfplumber
 import logging
+import nltk
+from nltk.tokenize import sent_tokenize
+import pandas as pd
+import io
+
+# Download NLTK data for sentence tokenization
+nltk.download('punkt')
+nltk.download('punkt_tab')
+
 try:
     import pytesseract
     from PIL import Image
@@ -27,7 +37,8 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app, resources={r"/serve_pdf/*": {"origins": "*"}})
-UPLOAD_FOLDER = 'uploads'
+UPLOAD_FOLDER = 'Uploads'
+MODEL_DIR = 'model'  # Directory to save/load the model and embeddings
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 # Global cache for model and precomputed data
@@ -39,11 +50,13 @@ MODEL_CACHE = {
 }
 
 def normalize_sentence(sentence):
+    """Normalize a sentence for consistent matching."""
     if not sentence:
         return ""
     return re.sub(r'[\'\"\\]', '', re.sub(r'\s+', ' ', sentence.strip()).replace('[\u200B-\u200D\uFEFF]', '').replace('[\x00-\x1F\x7F]', ''))
 
 def load_techniques_enriched(mitre_json_path):
+    """Load and enrich MITRE ATT&CK techniques with combined text and full names."""
     try:
         with open(mitre_json_path, "r") as f:
             data = json.load(f)
@@ -81,6 +94,7 @@ def load_techniques_enriched(mitre_json_path):
                 
                 techniques[tech_id] = {"text": combined_text, "name": full_name}
     
+    logger.info(f"Loaded {len(techniques)} techniques")
     return techniques
 
 try:
@@ -90,33 +104,88 @@ except Exception as e:
     raise
 
 def initialize_cache(techniques, batch_size=32):
+    """Initialize the model and precompute technique embeddings and TF-IDF key terms, or load from disk if available."""
+    model_save_path = os.path.join(MODEL_DIR, 'sentence_transformer_model')
+    data_save_path = os.path.join(MODEL_DIR, 'precomputed_data.pkl')
+
+    # Check if saved model and data exist
+    if os.path.exists(model_save_path) and os.path.exists(data_save_path):
+        logger.info("Loading saved model and precomputed data from disk")
+        try:
+            # Load the SentenceTransformer model
+            model = SentenceTransformer(model_save_path, device='cuda' if torch.cuda.is_available() else 'cpu')
+            
+            # Load the precomputed embeddings and metadata
+            with open(data_save_path, 'rb') as f:
+                saved_data = pickle.load(f)
+            
+            MODEL_CACHE['model'] = model
+            MODEL_CACHE['tech_embeddings'] = saved_data['tech_embeddings']
+            MODEL_CACHE['tech_ids'] = saved_data['tech_ids']
+            MODEL_CACHE['key_terms'] = saved_data['key_terms']
+            
+            logger.info("Successfully loaded saved model and precomputed data")
+            return
+        except Exception as e:
+            logger.warning(f"Failed to load saved model or data: {e}. Recomputing...")
+    
+    # If loading fails or files don't exist, compute and save
+    logger.info("No saved model found or loading failed. Initializing new model and computing embeddings...")
+    
+    # Create the model directory if it doesn't exist
+    if not os.path.exists(MODEL_DIR):
+        os.makedirs(MODEL_DIR)
+        logger.info(f"Created model directory: {MODEL_DIR}")
+    
+    # Initialize the model
+    model = SentenceTransformer('all-mpnet-base-v2', device='cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Precompute embeddings
+    tech_ids = np.array(list(techniques.keys()))
+    tech_texts = [t["text"] for t in techniques.values()]
+    tech_embeddings = model.encode(
+        tech_texts,
+        batch_size=batch_size,
+        convert_to_tensor=True,
+        show_progress_bar=True,
+        normalize_embeddings=True
+    )
+    
+    # Compute TF-IDF key terms
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=10000)
+    tfidf_matrix = vectorizer.fit_transform(tech_texts)
+    feature_names = vectorizer.get_feature_names_out()
+    key_terms = {}
+    for i, tech_id in enumerate(techniques.keys()):
+        tfidf_vector = tfidf_matrix[i].toarray()[0]
+        top_indices = tfidf_vector.argsort()[-5:][::-1]
+        key_terms[tech_id] = [(feature_names[idx], tfidf_vector[idx]) for idx in top_indices]
+    
+    # Populate the cache
+    MODEL_CACHE['model'] = model
+    MODEL_CACHE['tech_embeddings'] = tech_embeddings
+    MODEL_CACHE['tech_ids'] = tech_ids
+    MODEL_CACHE['key_terms'] = key_terms
+    
+    # Save the model
     try:
-        model = SentenceTransformer('all-mpnet-base-v2', device='cuda' if torch.cuda.is_available() else 'cpu')
-        tech_ids = np.array(list(techniques.keys()))
-        tech_texts = [t["text"] for t in techniques.values()]
-        tech_embeddings = model.encode(
-            tech_texts,
-            batch_size=batch_size,
-            convert_to_tensor=True,
-            show_progress_bar=False,
-            normalize_embeddings=True
-        )
-        vectorizer = TfidfVectorizer(stop_words='english', max_features=10000)
-        tfidf_matrix = vectorizer.fit_transform(tech_texts)
-        feature_names = vectorizer.get_feature_names_out()
-        key_terms = {}
-        for i, tech_id in enumerate(techniques.keys()):
-            tfidf_vector = tfidf_matrix[i].toarray()[0]
-            top_indices = tfidf_vector.argsort()[-5:][::-1]
-            key_terms[tech_id] = [(feature_names[idx], tfidf_vector[idx]) for idx in top_indices]
-        
-        MODEL_CACHE['model'] = model
-        MODEL_CACHE['tech_embeddings'] = tech_embeddings
-        MODEL_CACHE['tech_ids'] = tech_ids
-        MODEL_CACHE['key_terms'] = key_terms
+        model.save(model_save_path)
+        logger.info(f"Saved model to {model_save_path}")
     except Exception as e:
-        logger.error(f"Failed to initialize cache: {e}")
-        raise
+        logger.error(f"Failed to save model to {model_save_path}: {e}")
+    
+    # Save the precomputed embeddings and metadata
+    try:
+        saved_data = {
+            'tech_embeddings': tech_embeddings,
+            'tech_ids': tech_ids,
+            'key_terms': key_terms
+        }
+        with open(data_save_path, 'wb') as f:
+            pickle.dump(saved_data, f)
+        logger.info(f"Saved precomputed data to {data_save_path}")
+    except Exception as e:
+        logger.error(f"Failed to save precomputed data to {data_save_path}: {e}")
 
 try:
     initialize_cache(techniques)
@@ -125,6 +194,7 @@ except Exception as e:
     raise
 
 def fetch_report_text(url):
+    """Fetch and extract text from a report URL, minimizing duplicates."""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=10)
@@ -159,14 +229,16 @@ def fetch_report_text(url):
         return ""
 
 def extract_matches_with_boosts(text, techniques, top_n=5, batch_size=32, min_score=0.3):
+    """Extract technique matches using cached model and embeddings."""
     try:
         model = MODEL_CACHE['model']
         tech_embeddings = MODEL_CACHE['tech_embeddings']
         tech_ids = MODEL_CACHE['tech_ids']
         key_terms = MODEL_CACHE['key_terms']
         
+        # Use NLTK's sent_tokenize for better sentence splitting
         sentences = [
-            normalize_sentence(s) for s in re.split(r'[.!?]+', text)
+            normalize_sentence(s) for s in sent_tokenize(text)
             if len(s.strip()) > 20 and not s.strip().startswith(('http', 'www'))
         ]
         unique_sentences = list(dict.fromkeys(sentences))
@@ -255,7 +327,7 @@ def extract_matches_with_boosts(text, techniques, top_n=5, batch_size=32, min_sc
     
     except Exception as e:
         logger.error(f"Error extracting matches: {e}")
-        return [], {}
+        raise
 
 @app.route('/')
 def index():
@@ -278,7 +350,8 @@ def upload_file():
             text = data['text']
             if not text.strip():
                 logger.warning("Empty text provided in JSON request")
-                return jsonify({'error': 'Text cannot be empty'}), 400            
+                return jsonify({'error': 'Text cannot be empty'}), 400
+
             logger.info("Processing raw text")
             content = normalize_sentence(text)
             if content:
@@ -299,6 +372,8 @@ def upload_file():
             else:
                 logger.error("Failed to process raw text: no content extracted")
                 return jsonify({'content': 'Failed to process raw text.'}), 400
+
+        # Handle FormData for URL or PDF
         if 'file' in request.files and request.files['file'].filename:
             file = request.files['file']
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
@@ -308,7 +383,7 @@ def upload_file():
             if not os.path.exists(file_path):
                 logger.error(f"File not saved: {file_path}")
                 return jsonify({'content': 'Failed to save file.'}), 500
-            if file.filename.lower().endswith('.pdf'):
+            if file.filename.lower().endsWith('.pdf'):
                 logger.info(f"Extracting text from PDF: {file.filename}")
                 content = extract_text_from_pdf(file_path)
                 if content:
@@ -366,8 +441,128 @@ def upload_file():
         logger.error(f"Error processing upload: {e}")
         return jsonify({'error': f"Internal server error: {str(e)}"}), 500
 
+@app.route('/export', methods=['POST'])
+def export_data():
+    """Export analyzed data to the specified format (xlsx, csv, tsv, json, html)."""
+    try:
+        data = request.get_json()
+        if not data or 'format' not in data or 'tcode_to_sentences' not in data:
+            logger.warning("Invalid export request: missing format or data")
+            return jsonify({'error': 'Invalid request: missing format or data'}), 400
+
+        export_format = data['format'].lower()
+        tcode_to_sentences = data['tcode_to_sentences']
+        tcode_counts = data.get('tcode_counts', {})
+        tcode_names = data.get('tcode_names', {})
+
+        # Prepare data as a flat list for tabular formats
+        rows = []
+        for tcode, sentences in tcode_to_sentences.items():
+            technique_name = tcode_names.get(tcode, "Unknown")
+            count = tcode_counts.get(tcode, 0)
+            for entry in sentences:
+                rows.append({
+                    'T-Code': tcode,
+                    'Technique Name': technique_name,
+                    'Sentence': entry['sentence'],
+                    'Score': entry['score'],
+                    'Count': count
+                })
+
+        if not rows:
+            logger.warning("No data to export")
+            return jsonify({'error': 'No data to export'}), 400
+
+        # Handle different export formats
+        if export_format == 'xlsx':
+            df = pd.DataFrame(rows)
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='T-Code Matches')
+            output.seek(0)
+            return send_file(
+                output,
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                as_attachment=True,
+                download_name='tcode_matches.xlsx'
+            )
+
+        elif export_format in ['csv', 'tsv']:
+            df = pd.DataFrame(rows)
+            output = io.StringIO()
+            delimiter = ',' if export_format == 'csv' else '\t'
+            df.to_csv(output, index=False, sep=delimiter)
+            output.seek(0)
+            return send_file(
+                io.BytesIO(output.getvalue().encode('utf-8')),
+                mimetype=f'text/{export_format}',
+                as_attachment=True,
+                download_name=f'tcode_matches.{export_format}'
+            )
+
+        elif export_format == 'json':
+            export_data = {
+                'tcode_to_sentences': tcode_to_sentences,
+                'tcode_counts': tcode_counts,
+                'tcode_names': tcode_names
+            }
+            return send_file(
+                io.BytesIO(json.dumps(export_data, indent=2).encode('utf-8')),
+                mimetype='application/json',
+                as_attachment=True,
+                download_name='tcode_matches.json'
+            )
+
+        elif export_format == 'html':
+            df = pd.DataFrame(rows)
+            html_content = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>T-Code Matches Report</title>
+                <style>
+                    table {{
+                        width: 100%;
+                        border-collapse: collapse;
+                        font-family: Arial, sans-serif;
+                    }}
+                    th, td {{
+                        border: 1px solid #ddd;
+                        padding: 8px;
+                        text-align: left;
+                    }}
+                    th {{
+                        background-color: #f2f2f2;
+                    }}
+                    tr:nth-child(even) {{
+                        background-color: #f9f9f9;
+                    }}
+                </style>
+            </head>
+            <body>
+                <h1>T-Code Matches Report</h1>
+                {df.to_html(index=False, classes='table')}
+            </body>
+            </html>
+            """
+            return send_file(
+                io.BytesIO(html_content.encode('utf-8')),
+                mimetype='text/html',
+                as_attachment=True,
+                download_name='tcode_matches.html'
+            )
+
+        else:
+            logger.warning(f"Unsupported export format: {export_format}")
+            return jsonify({'error': f"Unsupported format: {export_format}"}), 400
+
+    except Exception as e:
+        logger.error(f"Error exporting data: {e}")
+        return jsonify({'error': f"Internal server error: {str(e)}"}), 500
+
 @app.route('/serve_pdf/<filename>')
 def serve_pdf(filename):
+    """Serve an uploaded PDF file."""
     try:
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file_path = os.path.normpath(file_path)
@@ -387,6 +582,7 @@ def serve_pdf(filename):
         return jsonify({'error': f"Failed to serve PDF: {e}"}), 500
 
 def extract_text_from_pdf(file_path):
+    """Extract text from a PDF file using pdfplumber, with OCR fallback."""
     try:
         logger.info(f"Opening PDF: {file_path}")
         with pdfplumber.open(file_path) as pdf:
@@ -422,4 +618,4 @@ if __name__ == '__main__':
     if not os.path.exists(UPLOAD_FOLDER):
         logger.info(f"Creating uploads folder: {UPLOAD_FOLDER}")
         os.makedirs(UPLOAD_FOLDER)
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    app.run(debug=False, host='127.0.0.1', port=5000)
